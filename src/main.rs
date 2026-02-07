@@ -64,7 +64,8 @@ struct Task {
 
 impl Task {
     fn is_done(&self) -> bool {
-        self.status.to_lowercase() == "done"
+        let s = self.status.to_lowercase();
+        s == "done" || s == "completed" || s == "x"
     }
 
     fn is_due_today(&self) -> bool {
@@ -99,7 +100,6 @@ fn extract_frontmatter(content: &str) -> Option<String> {
         return None;
     }
 
-    // Find the closing ---
     for (i, line) in lines.iter().enumerate().skip(1) {
         if *line == "---" {
             return Some(lines[1..i].join("\n"));
@@ -111,13 +111,13 @@ fn extract_frontmatter(content: &str) -> Option<String> {
 
 fn parse_task_file(path: &Path) -> Result<Task> {
     let content = fs::read_to_string(path)
-        .context(format!("Failed to read file: {}", path.display()))?;
+        .with_context(|| format!("Failed to read file: {}", path.display()))?;
 
     let frontmatter = extract_frontmatter(&content)
         .context("No frontmatter found")?;
 
     let mut task: Task = serde_yaml::from_str(&frontmatter)
-        .context("Failed to parse YAML frontmatter")?;
+        .with_context(|| format!("Failed to parse YAML in: {}", path.display()))?;
 
     task.filename = path
         .file_stem()
@@ -128,16 +128,39 @@ fn parse_task_file(path: &Path) -> Result<Task> {
     Ok(task)
 }
 
+/// Helper to scan a directory for .md files and add them to the tasks vector
+fn scan_dir(path: &Path, tasks: &mut Vec<Task>) {
+    if !path.exists() || !path.is_dir() {
+        return;
+    }
+
+    for entry in WalkDir::new(path)
+        .follow_links(true)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().and_then(|s| s.to_str()).map(|ext| ext.to_lowercase()) == Some("md".to_string()))
+    {
+        if let Ok(task) = parse_task_file(entry.path()) {
+            // Check if task already exists in list to avoid duplicates if Archive is a subfolder
+            if !tasks.iter().any(|t| t.filename == task.filename && t.date_created == task.date_created) {
+                tasks.push(task);
+            }
+        }
+    }
+}
+
 fn collect_tasks(vault_path: &Path) -> Result<Vec<Task>> {
     let mut tasks = Vec::new();
 
-    for entry in WalkDir::new(vault_path)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("md"))
-    {
-        if let Ok(task) = parse_task_file(entry.path()) {
-            tasks.push(task);
+    // 1. Scan the main TaskNotes directory (and its subfolders like Archive/)
+    scan_dir(vault_path, &mut tasks);
+
+    // 2. Explicitly check for an 'Archive' folder that might be a sibling 
+    // (In case your CLI path points to 'Tasks' but archive is at 'Archive')
+    if let Some(parent) = vault_path.parent() {
+        let archive_sibling = parent.join("Archive");
+        if archive_sibling.exists() && archive_sibling != vault_path {
+            scan_dir(&archive_sibling, &mut tasks);
         }
     }
 
@@ -151,36 +174,23 @@ fn main() -> Result<()> {
 
     match cli.command {
         Commands::All => {
-            let json = serde_json::to_string_pretty(&tasks)?;
-            println!("{}", json);
+            println!("{}", serde_json::to_string_pretty(&tasks)?);
         }
         Commands::Today => {
-            let today_tasks: Vec<_> = tasks.iter()
-                .filter(|t| t.is_due_today())
-                .collect();
-            let json = serde_json::to_string_pretty(&today_tasks)?;
-            println!("{}", json);
+            let filtered: Vec<_> = tasks.iter().filter(|t| t.is_due_today()).collect();
+            println!("{}", serde_json::to_string_pretty(&filtered)?);
         }
         Commands::Overdue => {
-            let overdue_tasks: Vec<_> = tasks.iter()
-                .filter(|t| t.is_overdue())
-                .collect();
-            let json = serde_json::to_string_pretty(&overdue_tasks)?;
-            println!("{}", json);
+            let filtered: Vec<_> = tasks.iter().filter(|t| t.is_overdue()).collect();
+            println!("{}", serde_json::to_string_pretty(&filtered)?);
         }
         Commands::Pending => {
-            let pending_tasks: Vec<_> = tasks.iter()
-                .filter(|t| !t.is_done())
-                .collect();
-            let json = serde_json::to_string_pretty(&pending_tasks)?;
-            println!("{}", json);
+            let filtered: Vec<_> = tasks.iter().filter(|t| !t.is_done()).collect();
+            println!("{}", serde_json::to_string_pretty(&filtered)?);
         }
         Commands::CompletedToday => {
-            let completed_today: Vec<_> = tasks.iter()
-                .filter(|t| t.is_completed_today())
-                .collect();
-            let json = serde_json::to_string_pretty(&completed_today)?;
-            println!("{}", json);
+            let filtered: Vec<_> = tasks.iter().filter(|t| t.is_completed_today()).collect();
+            println!("{}", serde_json::to_string_pretty(&filtered)?);
         }
         Commands::Count { today, overdue, completed_today } => {
             let count = if today {
